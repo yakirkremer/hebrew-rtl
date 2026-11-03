@@ -1,0 +1,18 @@
+{
+  "azmod": 1,
+  "id": "hebrew-rtl",
+  "name": "Hebrew RTL",
+  "version": "0.9.1",
+  "author": "yakirkremer",
+  "summary": "Hebrew on the XDJ-AZ: Hebrew letters, right-to-left names and a Hebrew search keyboard.",
+  "description": "Shows Hebrew track, artist, playlist and folder names in real Hebrew letters (the deck's fonts have none), right to left, with long names cut on the correct side and the selected row scrolling the Hebrew way. Adds a globe key to the search keyboard that switches between English and a Hebrew keyboard (Israeli layout; q = final pe, w = final tsadi). Invisible direction marks in tags are hidden. No files on the deck are changed. Made for XDJ-AZ firmware 2.00 with AZ-MODS 2.01 only (firmware tag ep147-9e9454e357389ece); on other firmware it does not load.",
+  "license": "GPL-3.0-only",
+  "source": "https://github.com/yakirkremer/hebrew-rtl",
+  "api": 1,
+  "firmware": [
+    "ep147-9e9454e357389ece"
+  ],
+  "hooks": true,
+  "min_core": "1.2.3",
+  "category": "visual"
+}
