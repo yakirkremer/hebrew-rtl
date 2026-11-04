@@ -147,7 +147,7 @@ Notes:
 
 ## Known limitations
 
-- **Several words in the search box.** Typing more than one Hebrew word shows the words left to right in the search box, though each word is spelled correctly. The search itself is correct.
+- **The search box's cursor.** With Hebrew in the search box, the cursor is drawn on the right of the text instead of the left. Typing and deleting work normally.
 - **Arabic.** Arabic letters show, but are not joined.
 - **Wrapped text.** Text that wraps onto several lines may be in an imperfect order.
 - **One firmware only.** The mod is made for one firmware build. After a firmware update it stays off until a new version supports that firmware.
@@ -169,11 +169,12 @@ Unit tests run on your computer with clang:
 ```bash
 clang -std=gnu11 -fsanitize=address,undefined -I . bidi.c tests/test_bidi.c -o out/test_bidi && out/test_bidi
 clang -std=gnu11 -DHEB_GLYPHS_TEST -fsanitize=address,undefined -I . glyphs.c bidi.c tests/test_glyphs.c -lm -o out/test_glyphs && out/test_glyphs
+clang -std=gnu11 -fsanitize=address,undefined -I . -I <sdk>/include tests/test_editor.c bidi.c glyphs.c -lm -o out/test_editor && out/test_editor
 ```
 
 | File | What |
 |---|---|
-| `hebrew-rtl.c` | the hooks: right-to-left lines, cutting, the scrolling row, the search keyboard |
+| `hebrew-rtl.c` | the hooks: right-to-left lines, cutting, the scrolling row, the search field's word order, the search keyboard |
 | `bidi.c` | a small Unicode bidirectional algorithm (UAX #9 subset) |
 | `glyphs.c` | adds the Hebrew letters to the deck's fonts in memory, from the built-in font |
 | `heb_font.h` | Noto Sans Hebrew SemiBold, Hebrew letters only |

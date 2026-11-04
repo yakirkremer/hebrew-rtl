@@ -45,6 +45,30 @@
  * lays the line out unbounded, then for one line too wide calls fitLineIntoSpace, which
  * cuts the right end behind "...". The deck strips' track titles come this way. */
 #define ADDR_ADD_FITTED_TEXT 0x25583f0u
+/* juce::GlyphArrangement::addLineOfText(const Font&, const String&, float x, float y): a
+ * thunk into addCurtailedLineOfText with no width limit. juce::TextEditor::drawContent
+ * (0x25eccd0, the search field's paint) lays out each word ("atom") with it at the x its
+ * left-to-right Iterator gives, so a Hebrew query shows its words in the wrong order. */
+#define ADDR_ADD_LINE_OF_TEXT 0x25552a0u
+/* drawContent's own frame: x29 is its sp after the prologue, its Iterator lives at +0xd0,
+ * and the atom's text (atom->getTrimmedText(), returned through x8) is the String at +0xb8
+ * that it passes to addLineOfText. That address identifies the call. */
+#define DRAW_CONTENT_RETURN   0x25ed250u
+#define DRAW_CONTENT_ITERATOR 0xd0
+#define DRAW_CONTENT_TEXT     0xb8
+/* juce::TextEditor::Iterator, from its constructor (0x2659120) and next() (0x2658b40). */
+#define IT_ATOM_X     0x14  /* float: where the current atom starts */
+#define IT_ATOM       0x20  /* const TextAtom*: &section->atoms[atom_index - 1] */
+#define IT_SECTION    0x28  /* const UniformTextSection* */
+#define IT_SECTIONS   0x30  /* const OwnedArray<UniformTextSection>*: data +0, size +0x10 */
+#define IT_WRAP_WIDTH 0x48  /* float */
+/* UniformTextSection: Array<TextAtom> atoms at +0x10 (data +0x10, size +0x20). TextAtom:
+ * String atomText +0, float width +8, uint16 numChars +0xc, 16 bytes. */
+#define SECTION_ATOMS     0x10
+#define SECTION_NUM_ATOMS 0x20
+#define ATOM_SIZE         16
+#define ATOM_WIDTH        8
+#define EDITOR_MAX_ATOMS  128
 /* juce::CustomTypeface::getStringWidth(const String&) and getGlyphPositions(const String&,
  * Array<int>&, Array<float>&): every piece of text is measured or laid out through one of
  * them (FreeTypeTypeface's vtable, slots 6 and 7), and both look characters up with an
@@ -121,6 +145,9 @@ typedef void (*glyph_positions_fn)(const void *font, char *const *text,
 static const az_core_v1 *C;
 static add_line_fn orig_add_line;
 static draw_text_fn orig_draw_text;
+typedef void (*add_line_of_text_fn)(void *arrangement, const void *font, char *const *text,
+                                    float x, float y);
+static add_line_of_text_fn orig_add_line_of_text;
 static add_fitted_fn orig_add_fitted;
 typedef float (*string_width_fn)(void *typeface, char *const *text);
 typedef void (*typeface_positions_fn)(void *typeface, char *const *text, void *glyphs,
@@ -304,6 +331,95 @@ static void hook_add_fitted(void *arrangement, const void *font, char *const *te
     line_ellipsis = saved_ellipsis;
 }
 
+enum { ATOM_NEUTRAL, ATOM_LTR, ATOM_RTL };
+
+static int atom_class(const char *s)
+{
+    if (heb_bidi_has_rtl(s)) return ATOM_RTL;
+    for (; *s; s++) {
+        unsigned char c = (unsigned char)*s;
+        if ((c >= '0' && c <= '9') || ((c | 0x20) >= 'a' && (c | 0x20) <= 'z') || c >= 0xC0)
+            return ATOM_LTR;
+    }
+    return ATOM_NEUTRAL;
+}
+
+/* The x a right-to-left line puts this atom at, or `x` when the line is not one the
+ * search field draws plainly: one section, one line, only its own atoms. Words keep their
+ * own letters' order (hook_add_line handles that); here the words themselves are ordered
+ * the bidi way, with runs of left-to-right words (Latin, numbers) kept in their order. */
+static float editor_atom_x(const unsigned char *it, float x)
+{
+    const unsigned char *atom = *(const unsigned char *const *)(it + IT_ATOM);
+    const unsigned char *section = *(const unsigned char *const *)(it + IT_SECTION);
+    const unsigned char *sections = *(const unsigned char *const *)(it + IT_SECTIONS);
+    if (!atom || !section || !sections || *(const int *)(sections + 0x10) != 1 ||
+        **(const unsigned char *const *const *)sections != section)
+        return x;
+    const unsigned char *atoms = *(const unsigned char *const *)(section + SECTION_ATOMS);
+    int n = *(const int *)(section + SECTION_NUM_ATOMS);
+    if (!atoms || n < 1 || n > EDITOR_MAX_ATOMS || atom < atoms ||
+        atom >= atoms + (size_t)n * ATOM_SIZE || (size_t)(atom - atoms) % ATOM_SIZE)
+        return x;
+    int k = (int)((size_t)(atom - atoms) / ATOM_SIZE);
+
+    unsigned char level[EDITOR_MAX_ATOMS];
+    int cls[EDITOR_MAX_ATOMS], order[EDITOR_MAX_ATOMS];
+    float width[EDITOR_MAX_ATOMS], total = 0.0f;
+    int first_strong = ATOM_NEUTRAL;
+    for (int i = 0; i < n; i++) {
+        const char *t = *(const char *const *)(atoms + (size_t)i * ATOM_SIZE);
+        if (!t || *t == '\n' || *t == '\r') return x;
+        cls[i] = atom_class(t);
+        if (first_strong == ATOM_NEUTRAL) first_strong = cls[i];
+        width[i] = *(const float *)(atoms + (size_t)i * ATOM_SIZE + ATOM_WIDTH);
+        total += width[i];
+    }
+    if (first_strong != ATOM_RTL || total > *(const float *)(it + IT_WRAP_WIDTH) + 0.5f)
+        return x;
+
+    /* Levels: right-to-left words 1, left-to-right words 2, a neutral atom (a space, a dash)
+     * 2 only between two left-to-right words. */
+    for (int i = 0; i < n; i++) {
+        if (cls[i] != ATOM_NEUTRAL) { level[i] = cls[i] == ATOM_LTR ? 2 : 1; continue; }
+        int before = ATOM_RTL, after = ATOM_RTL;
+        for (int j = i - 1; j >= 0; j--) if (cls[j] != ATOM_NEUTRAL) { before = cls[j]; break; }
+        for (int j = i + 1; j < n; j++) if (cls[j] != ATOM_NEUTRAL) { after = cls[j]; break; }
+        level[i] = before == ATOM_LTR && after == ATOM_LTR ? 2 : 1;
+    }
+    /* Rule L2: reverse each run at level 2 or more, then the whole line. */
+    for (int i = 0; i < n; i++) order[i] = i;
+    for (int i = 0; i < n;) {
+        if (level[order[i]] < 2) { i++; continue; }
+        int j = i;
+        while (j < n && level[order[j]] >= 2) j++;
+        for (int a = i, b = j - 1; a < b; a++, b--) { int t = order[a]; order[a] = order[b]; order[b] = t; }
+        i = j;
+    }
+    for (int a = 0, b = n - 1; a < b; a++, b--) { int t = order[a]; order[a] = order[b]; order[b] = t; }
+
+    float start = *(const float *)(it + IT_ATOM_X);
+    for (int i = 0; i < k; i++) start -= width[i];
+    float vx = start;
+    for (int v = 0; v < n && order[v] != k; v++) vx += width[order[v]];
+    return vx;
+}
+
+static void hook_add_line_of_text(void *arrangement, const void *font, char *const *text,
+                                  float x, float y)
+{
+    if (enabled && (uintptr_t)__builtin_return_address(0) == DRAW_CONTENT_RETURN) {
+        /* our own frame record holds the caller's x29: drawContent's frame */
+        const unsigned char *frame = *(const unsigned char *const *)__builtin_frame_address(0);
+        /* The text this call draws is the String drawContent made in its own frame, and the
+         * Iterator there says the atom starts at x: only then is the frame read as such. */
+        if (frame && (const unsigned char *)text == frame + DRAW_CONTENT_TEXT &&
+            *(const float *)(frame + DRAW_CONTENT_ITERATOR + IT_ATOM_X) == x)
+            x = editor_atom_x(frame + DRAW_CONTENT_ITERATOR, x);
+    }
+    orig_add_line_of_text(arrangement, font, text, x, y);
+}
+
 /* Hebrew letters the deck's font lacks come from the built-in font (glyphs.c): they are
  * added to the typeface just before it looks them up, so it never falls back to a box. */
 static float hook_string_width(void *typeface, char *const *text)
@@ -327,6 +443,16 @@ static const char *const HEBREW_KEYS[26] = {
     "מ", "ם", "פ", "ף", "ר", "ד", "א", "ו", "ה", "ץ", "ס", "ט", "ז",   /* n..z */
 };
 
+/* One fixed string per letter: sendCharacter keeps a reference to the String it is given
+ * (a juce::String copy shares the text) for a callback that may run later, so a buffer
+ * reused for the next key could change a letter not yet typed. Filled once in init. */
+static struct {
+    int ref_count;
+    size_t allocated;
+    char text[8];
+} hebrew_key_text[26];
+_Static_assert(offsetof(__typeof__(hebrew_key_text[0]), text) == 16, "JUCE 5 StringHolder layout");
+
 /* In Hebrew mode a letter key types the Hebrew letter in its place. */
 static void hook_send_character(void *sender, char *const *text, int arg)
 {
@@ -335,10 +461,7 @@ static void hook_send_character(void *sender, char *const *text, int arg)
         char c = s[0];
         if (c >= 'A' && c <= 'Z') c = (char)(c - 'A' + 'a');
         if (c >= 'a' && c <= 'z') {
-            static __thread struct juce_string_holder holder;
-            strcpy(holder.text, HEBREW_KEYS[c - 'a']);
-            holder_set(&holder);
-            char *hebrew = holder.text;
+            char *hebrew = hebrew_key_text[c - 'a'].text;
             orig_send_character(sender, &hebrew, arg);
             return;
         }
@@ -348,12 +471,14 @@ static void hook_send_character(void *sender, char *const *text, int arg)
 
 /* The language keys. The deck's letter keys show images of their Latin letters, made when
  * the keyboard is built, so they cannot be relabelled. Instead:
- *   English: one key of our own, the globe, in the gap between 123 and z.
- *   Hebrew:  a surface over the three letter rows, with the 26 keys in the deck's places and
- *            sizes showing their Hebrew letters (kbd_icons.h), and the globe in its place.
- *            A tap sends the letter through the deck's own EventSender. 123, backspace and
- *            SPACE stay the deck's.
- * Both show only while the search keyboard does. Geometry: the deck's keys, in panel pixels. */
+ *   The globe: one key of our own in the gap between 123 and z, in both languages.
+ *   Hebrew:    two surfaces over the letter rows (q..p and a..l; z..m), with the 26 keys in
+ *              the deck's places and sizes showing their Hebrew letters (kbd_icons.h). They
+ *              only paint: with no on_input the core makes them input-transparent, so a tap
+ *              reaches the deck's own key underneath, which types on EP147's message thread
+ *              and hook_send_character turns the letter Hebrew there. Typing from the core's
+ *              UI thread instead would edit the search field while EP147 paints it.
+ * All show only while the search keyboard does. Geometry: the deck's keys, in panel pixels. */
 #define GLOBE_KEY_X 165
 #define GLOBE_KEY_Y 707
 #define KEY_W 90
@@ -365,10 +490,14 @@ static void hook_send_character(void *sender, char *const *text, int arg)
 #define ROW1_Y 538
 #define ROW2_Y 622
 #define ROW3_Y 706
-#define HEB_KEYS_X 140              /* the surface over the letter rows */
-#define HEB_KEYS_Y 533
-#define HEB_KEYS_W 1000
-#define HEB_KEYS_H 252
+#define HEB_TOP_X 140               /* the surface over q..p and a..l, margins included */
+#define HEB_TOP_Y 533
+#define HEB_TOP_W 1000
+#define HEB_TOP_H 168
+#define HEB_ROW3_X 290              /* the one over z..m, clear of the globe */
+#define HEB_ROW3_Y 701
+#define HEB_ROW3_W 700
+#define HEB_ROW3_H 84
 /* Colors. The deck draws its keyboard in neutral grays and the Themes mod maps them (Day,
  * AZ-MODS, Midnight, ...); the core's fill_rect passes our colors through the same map, so
  * giving it the deck's own stock grays makes the Hebrew keys match the deck in every theme.
@@ -451,9 +580,12 @@ static void paint_face(az_draw *d, int x, int y, int w, int h, int down)
 }
 
 static const char ROW1[] = "qwertyuiop", ROW2[] = "asdfghjkl", ROW3[] = "zxcvbnm";
-static az_surface *heb_keys;
+static az_surface *heb_top, *heb_row3;
 static int heb_shown;
 static int key_down = -1;           /* the key under the finger: 'a'..'z', 'G' = globe */
+/* The first contact, as the touch filter saw it (bus thread): 0 when up, else
+ * 1 << 31 | y << 16 | x. It only watches; every touch goes on to EP147. */
+static unsigned touch_seen;
 
 static void toggle_language(void)
 {
@@ -519,41 +651,29 @@ static void paint_row(az_draw *d, const char *keys, int x, int y)
     }
 }
 
-static void heb_keys_paint(az_draw *d, az_rect area, void *user)
+static void heb_top_paint(az_draw *d, az_rect area, void *user)
 {
     (void)user;
     C->fill_rect(d, area.x, area.y, area.w, area.h, STOCK_KBD_BG);
     paint_row(d, ROW1, ROW1_X, ROW1_Y);
     paint_row(d, ROW2, ROW2_X, ROW2_Y);
-    paint_row(d, ROW3, ROW3_X, ROW3_Y);
-    paint_globe(d, GLOBE_KEY_X, GLOBE_KEY_Y, key_down == 'G');
 }
 
-/* Types a Hebrew letter as the deck's own key handler would. */
-static void send_hebrew(int key)
-{
-    const char *ctl = __atomic_load_n(&kbd_controller, __ATOMIC_ACQUIRE);
-    if (!ctl) return;
-    static struct juce_string_holder letter;
-    strcpy(letter.text, HEBREW_KEYS[key - 'a']);
-    holder_set(&letter);
-    char *text = letter.text;
-    orig_send_character((void *)(ctl + KBD_CONTROLLER_SENDER), &text, 0);
-}
-
-static int heb_keys_input(const az_event *ev, void *user)
+static void heb_row3_paint(az_draw *d, az_rect area, void *user)
 {
     (void)user;
-    if (!kbd_enabled) return 1;     /* like the deck's keys while there is no source */
-    int k = key_at(ev->x, ev->y);
-    if (ev->kind == AZ_EV_DOWN) key_down = k;
-    else if (ev->kind == AZ_EV_UP) key_down = -1;
-    else if (ev->kind == AZ_EV_TAP && k == 'G') toggle_language();
-    else if (ev->kind == AZ_EV_TAP && k >= 'a' && k <= 'z') send_hebrew(k);
-    if (ev->kind == AZ_EV_DOWN || ev->kind == AZ_EV_UP || ev->kind == AZ_EV_TAP)
-        C->surface_redraw(heb_keys);
-    return ev->kind == AZ_EV_TAP || ev->kind == AZ_EV_DOWN || ev->kind == AZ_EV_UP ||
-           ev->kind == AZ_EV_LONG;
+    C->fill_rect(d, area.x, area.y, area.w, area.h, STOCK_KBD_BG);
+    paint_row(d, ROW3, ROW3_X, ROW3_Y);
+}
+
+static int watch_touch(const az_touch *t, void *user)
+{
+    (void)user;
+    unsigned v = 0;
+    if (t->down && t->x >= 0 && t->x < 0x8000 && t->y >= 0 && t->y < 0x8000)
+        v = 1u << 31 | (unsigned)t->y << 16 | (unsigned)t->x;
+    __atomic_store_n(&touch_seen, v, __ATOMIC_RELAXED);
+    return AZ_TOUCH_PASS;
 }
 
 /* The globe key shows and hides with the search keyboard: the controller is remembered
@@ -611,8 +731,28 @@ static int search_keyboard_visible(void)
     return widget && (widget[COMPONENT_FLAGS] & COMPONENT_VISIBLE_BIT);
 }
 
+static void redraw_letters(void)
+{
+    C->surface_redraw(heb_top);
+    C->surface_redraw(heb_row3);
+}
+
+/* The pressed look for the Hebrew key under the finger. The deck draws its own pressed key
+ * under our surface, out of sight, so it is shown from what the touch filter saw. */
+static void follow_touch(void)
+{
+    unsigned t = __atomic_load_n(&touch_seen, __ATOMIC_RELAXED);
+    int k = t && kbd_enabled ? key_at((int)(t & 0xffff), (int)((t >> 16) & 0x7fff)) : -1;
+    if (k == 'G') return;                   /* the globe key follows its own input */
+    if (k < 'a' || k > 'z') k = -1;
+    if (k != key_down && key_down != 'G') {
+        key_down = k;
+        redraw_letters();
+    }
+}
+
 /* surface_show belongs on the core's UI thread, so the language keys follow the keyboard
- * here: the globe alone in English, the Hebrew keys (with the globe) in Hebrew. */
+ * here: the globe in both languages, the Hebrew letters in Hebrew. */
 static void tick(void)
 {
     int shown = kbd_hooked && search_keyboard_visible();
@@ -627,7 +767,7 @@ static void tick(void)
         if (changed) {
             key_down = -1;
             if (globe_key) C->surface_redraw(globe_key);
-            if (heb_keys) C->surface_redraw(heb_keys);
+            if (heb_top) redraw_letters();
         }
     }
     if (shown) {
@@ -635,16 +775,18 @@ static void tick(void)
         const char *widget = ctl ? *(const char *const *)(ctl + KBD_CONTROLLER_WIDGET) : NULL;
         shown = widget && letter_layout_showing(widget);   /* not in the 123 layout */
     }
-    int want_globe = shown && !he, want_heb = shown && he && heb_keys;
+    int want_globe = shown, want_heb = shown && he && heb_top;
     if (globe_key && want_globe != globe_shown) {
         C->surface_show(globe_key, want_globe);
         globe_shown = want_globe;
     }
-    if (heb_keys && want_heb != heb_shown) {
-        C->surface_show(heb_keys, want_heb);
+    if (heb_top && want_heb != heb_shown) {
+        C->surface_show(heb_top, want_heb);
+        C->surface_show(heb_row3, want_heb);
         heb_shown = want_heb;
-        key_down = -1;
+        if (key_down != 'G') key_down = -1;
     }
+    if (heb_shown) follow_touch();
 }
 
 static const az_surface_v1 GLOBE_KEY = {
@@ -655,12 +797,19 @@ static const az_surface_v1 GLOBE_KEY = {
     .on_input = globe_input,
 };
 
-static const az_surface_v1 HEB_KEYS = {
+/* No on_input: input-transparent, so the deck's keys underneath get the taps. */
+static const az_surface_v1 HEB_TOP = {
     .size = sizeof(az_surface_v1),
     .layer = AZ_LAYER_OVER_EP147,
     .views = AZ_VIEW_BIT(AZ_VIEW_SEARCH),
-    .on_paint = heb_keys_paint,
-    .on_input = heb_keys_input,
+    .on_paint = heb_top_paint,
+};
+
+static const az_surface_v1 HEB_ROW3 = {
+    .size = sizeof(az_surface_v1),
+    .layer = AZ_LAYER_OVER_EP147,
+    .views = AZ_VIEW_BIT(AZ_VIEW_SEARCH),
+    .on_paint = heb_row3_paint,
 };
 
 static int init(const az_core_v1 *core)
@@ -669,6 +818,11 @@ static int init(const az_core_v1 *core)
     enabled = C->cfg_get(MOD_ID, "enabled", 1);
     glyphs_on = C->cfg_get(MOD_ID, "glyphs", 1) && heb_glyphs_init() == 0;
     kbd_hebrew = C->cfg_get(MOD_ID, "kbd_hebrew", 0) != 0;
+    for (int i = 0; i < 26; i++) {
+        hebrew_key_text[i].ref_count = 0x3fffffff;          /* never freed, as holder_set */
+        hebrew_key_text[i].allocated = sizeof hebrew_key_text[i].text;
+        strcpy(hebrew_key_text[i].text, HEBREW_KEYS[i]);
+    }
     tinted_letters = malloc(sizeof kbd_letters);
     tinted_globe_en = malloc(sizeof kbd_face_en);
     tinted_globe_he = malloc(sizeof kbd_face_he);
@@ -676,8 +830,16 @@ static int init(const az_core_v1 *core)
     /* The globe key, before the hooks: a surface can fail, a claimed hook stays. */
     if (AZ_HAS(C, surface_create) && (globe_key = C->surface_create(MOD_ID, &GLOBE_KEY))) {
         C->surface_place(globe_key, (az_rect){ GLOBE_KEY_X, GLOBE_KEY_Y, KBD_KEY_W, KBD_KEY_H });
-        if ((heb_keys = C->surface_create(MOD_ID, &HEB_KEYS)))
-            C->surface_place(heb_keys, (az_rect){ HEB_KEYS_X, HEB_KEYS_Y, HEB_KEYS_W, HEB_KEYS_H });
+        heb_top = C->surface_create(MOD_ID, &HEB_TOP);
+        heb_row3 = heb_top ? C->surface_create(MOD_ID, &HEB_ROW3) : NULL;
+        if (heb_row3) {
+            C->surface_place(heb_top, (az_rect){ HEB_TOP_X, HEB_TOP_Y, HEB_TOP_W, HEB_TOP_H });
+            C->surface_place(heb_row3, (az_rect){ HEB_ROW3_X, HEB_ROW3_Y, HEB_ROW3_W, HEB_ROW3_H });
+        } else {
+            heb_top = NULL;                 /* both or neither; a created one stays hidden */
+        }
+        /* Only watches (the pressed look); without it the Hebrew keys just don't light up. */
+        if (heb_top && AZ_HAS(C, touch_filter)) C->touch_filter(MOD_ID, watch_touch, NULL);
     }
     /* Last, after everything that can fail: a claimed hook stays live until restart. */
     if (C->claim_hook(MOD_ID, ADDR_ADD_CURTAILED_LINE, (void *)hook_add_line,
@@ -690,6 +852,9 @@ static int init(const az_core_v1 *core)
     if (C->claim_hook(MOD_ID, ADDR_ADD_FITTED_TEXT, (void *)hook_add_fitted,
                       (void **)&orig_add_fitted) != 0)
         C->log(MOD_ID, "addFittedText hook refused: fitted right-to-left lines cut on the right");
+    if (C->claim_hook(MOD_ID, ADDR_ADD_LINE_OF_TEXT, (void *)hook_add_line_of_text,
+                      (void **)&orig_add_line_of_text) != 0)
+        C->log(MOD_ID, "addLineOfText hook refused: Hebrew words in the search field read left to right");
     if (glyphs_on &&
         (C->claim_hook(MOD_ID, ADDR_TYPEFACE_STRING_WIDTH, (void *)hook_string_width,
                        (void **)&orig_string_width) != 0 ||
