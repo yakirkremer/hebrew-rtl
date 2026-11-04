@@ -10,9 +10,11 @@ An [AZ-MODS](https://github.com/Kyle-Hosman/xdj-az-mods) community mod. It gives
   - The selected row scrolls the Hebrew way.
 - **A Hebrew search keyboard.** A globe key on the search screen switches between English and Hebrew (Israeli layout).
 
-![Hebrew track names in the browser](docs/browser.png)
+![Illustration: Hebrew track names in the browser, right to left](docs/browser.png)
 
-![The Hebrew search keyboard](docs/keyboard.png)
+![Illustration: the Hebrew search keyboard with the globe key](docs/keyboard.png)
+
+*Illustrations with example names, not screenshots of the deck.*
 
 The mod changes no files on the deck. It runs only while a USB with the mod is in the deck. Take the USB out, or switch the mod off, and the deck is exactly as before.
 
